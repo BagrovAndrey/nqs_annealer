@@ -36,7 +36,6 @@ def load_ground_state(filename: str):
         basis_representatives = f["/basis/representatives"][:]
     return torch.from_numpy(ground_state), energy, basis_representatives
 
-
 def load_basis_and_hamiltonian(filename: str):
     with open(filename, "r") as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
@@ -77,9 +76,6 @@ def combine_amplitude_and_sign(
                  )
                  return torch.cat([a, b], dim=1)
 
-         def dummy(self, x):
-             return x
-
      m = CombiningState(*modules)
      if use_jit:
          m = torch.jit.script(m)
@@ -107,14 +103,13 @@ def combine_amplitude_and_explicit_sign(
              self.exact_sign = exact_sign
 
          def forward(self, x):
-             a = torch.log(self.amplitude(x)) if self.apply_log else self.amplitude(x)
-             a = a.reshape(1,-1)[0]
-             print("Internal report a", a)
-             b = self.exact_sign(x)
-             print("Internal report b", b)
-             a = (a*b).reshape(-1,1)
+             a = self.amplitude(x)
+             b = (-(self.exact_sign(x)-1.)*1.570796326794897).view([-1, 1])
 
-             return a
+             cat = torch.cat([a, b], dim=1)
+             complexify = torch.view_as_complex(cat).view([-1,1])
+
+             return complexify
 
      m = CombiningState(*modules)
  #    if use_jit:
@@ -151,21 +146,11 @@ def main():
 
 #   Testing data transformations
 
-    test_spin = np.array([representatives[123], representatives[125], representatives[323]])
+    test_spin = np.array([representatives[123], representatives[125], representatives[323], representatives[1002], representatives[1311]])
     recovered_inds = basis.batched_index(test_spin)
 
     torch_spins = torch.from_numpy(test_spin.view(np.int64)).reshape(-1,1)
     np_spins = torch_spins[:,:1].reshape(1,-1)[0].numpy().view(np.uint64)
-
-#    print(np_spins)
-#    print(basis.batched_index(np_spins))
-    
-#    unpacking = torch.nn.Sequential(
-#        nqs.Unpack(number_spins),
-#    ).to(device)
-
-#    print("unpacked", unpack_bits.unpack(torch_spins, number_spins))
-#    print("unpacking", unpacking(torch_spins))
 
     getting_sign = vector_to_module(sign_structure, basis)
     print("Signs harvested", getting_sign(torch_spins))    
@@ -176,17 +161,11 @@ def main():
         torch.nn.ReLU(),
         torch.nn.Linear(144, 1, bias=False),
     ).to(device)
-    phase = torch.nn.Sequential(
-        nqs.Unpack(number_spins),
-        torch.nn.Linear(number_spins, 144),
-        torch.nn.ReLU(),
-        torch.nn.Linear(144, 1, bias=False),
-    ).to(device)
-    combined_state = combine_amplitude_and_sign(amplitude, phase)
-    print(amplitude, phase, combined_state)
-    combined_state_2 = combine_amplitude_and_explicit_sign(amplitude, getting_sign)
-    print(combined_state(torch_spins))
-    print(combined_state_2(torch_spins))
-#    combined_state = combine_amplitude_and_explicit_sign(amplitude, sign_model)
+
+    combined_state = combine_amplitude_and_explicit_sign(amplitude, getting_sign)
+#    print(combined_state(torch_spins))
+
+    local_en = nqs.local_values(torch_spins, hamiltonian, combined_state)
+    print(local_en)
 
 main()
