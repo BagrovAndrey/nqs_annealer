@@ -129,6 +129,7 @@ def forward_with_batches(f, xs, batch_size: int, device=None) -> Tensor:
     samples at a time. ``xs`` is split into batches along the first dimension
     (i.e. dim=0). ``f`` must return a torch.Tensor.
     """
+
     if xs.shape[0] == 0:
         raise ValueError("invalid xs: {}; input should not be empty".format(xs))
     out = []
@@ -167,6 +168,7 @@ def extract_classical_ising_model(
     def forward(x):
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x.view(np.int64))
+            print("x.size()", x.size())
             if device is not None:
                 x = x.to(device)
         r = forward_with_batches(log_ψ, x, batch_size=10240)

@@ -5,7 +5,7 @@ from collections import namedtuple
 from typing import Tuple
 import lattice_symmetries as ls
 import nqs_playground as nqs
-from nqs_playground.core import _get_dtype, _get_device
+from nqs_playground.core import get_dtype, get_device   # Temporary test
 import torch
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -15,6 +15,7 @@ from loguru import logger
 import sys
 import numpy as np
 import concurrent.futures
+import unpack_bits
 
 class TensorIterableDataset(torch.utils.data.IterableDataset):
     def __init__(self, *tensors, batch_size=1, shuffle=False):
@@ -126,8 +127,8 @@ def tune_neural_network(
     on_epoch_end=default_on_epoch_end,
 ):
     logger.info("Starting supervised training...")
-    dtype = _get_dtype(model)   # _ removed
-    device = _get_device(model) # _ removed
+    dtype = get_dtype(model)   # _ removed
+    device = get_device(model) # _ removed
     train_dataset, test_dataset = prepare_datasets(
         spins, target_signs, weights, device=device, dtype=dtype, train_batch_size=batch_size
     )
@@ -174,6 +175,9 @@ def _extract_classical_model_with_exact_fields(
         if spin.ndim > 1:
             spin = spin[:, 0]
         indices = torch.from_numpy(ls.batched_index(basis, spin).view(np.int64)).to(device)
+
+        print("indices", indices.size())
+
         a = log_amplitude[indices]
         b = log_sign[indices]
         return torch.complex(a, b)
@@ -185,7 +189,6 @@ def _extract_classical_model_with_exact_fields(
         sampled_power=sampled_power,
         device=device,
     )
-
 
 def tune_sign_structure(
     spins: np.ndarray,
@@ -269,7 +272,6 @@ Config = namedtuple(
     ],
 )
 
-
 def _make_log_coeff_fn(amplitude, sign, basis, dtype, device):
 
     print("No problem 1", flush=True)
@@ -287,8 +289,6 @@ def _make_log_coeff_fn(amplitude, sign, basis, dtype, device):
     @torch.no_grad()
     def log_coeff_fn(spin: Tensor) -> Tensor:
 
-        print("sign(spin).size()", sign(spin).size())
-
         b = np.pi * sign(spin).argmax(dim=1, keepdim=True).to(dtype)
         spin = spin.cpu().numpy().view(np.uint64)
         if spin.ndim > 1:
@@ -296,42 +296,22 @@ def _make_log_coeff_fn(amplitude, sign, basis, dtype, device):
         indices = torch.from_numpy(ls.batched_index(basis, spin).view(np.int64)).to(device)
         a = log_amplitude[indices]
 
-        print("a.size()", a.size())
-        print("b.size()", b.size())
-
         return torch.complex(a, b)
 
     print("No problem 3", flush=True)
 
     return log_coeff_fn
 
-
-def _make_log_amplitude_fn(amplitude, basis, device, dtype):
-    assert isinstance(amplitude, Tensor)
-    log_amplitude = amplitude.log().unsqueeze(dim=1)
-    log_amplitude = log_amplitude.to(device=device, dtype=dtype)
-
-    @torch.no_grad()
-    def log_coeff_fn(spin: Tensor) -> Tensor:
-        spin = spin.cpu().numpy().view(np.uint64)
-        if spin.ndim > 1:
-            spin = spin[:, 0]
-        indices = torch.from_numpy(ls.batched_index(basis, spin).view(np.int64)).to(device)
-        return log_amplitude[indices]
-
-    return log_coeff_fn
-
-
 def find_ground_state(config):
     hamiltonian = config.hamiltonian
     basis = hamiltonian.basis
     # all_spins = torch.from_numpy(basis.states.view(np.int64))
     try:
-        dtype = _get_dtype(config.model)  # _ removed
+        dtype = get_dtype(config.model)  # _ removed
     except AttributeError:
         dtype = torch.float32
     try:
-        device = _get_device(config.model)  # _ removed
+        device = get_device(config.model)  # _ removed
     except AttributeError:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -361,9 +341,13 @@ def find_ground_state(config):
     def compute_metrics():
         with torch.no_grad():
             config.model.eval()
+            print("Checkpoint 1.5", flush=True)
             all_spins = torch.from_numpy(basis.states.view(np.int64)).to(device)
-            predicted_sign_structure = forward_with_batches(config.model, all_spins, 16384)
+            print("Checkpoint 1.6", flush=True)
+            predicted_sign_structure = forward_with_batches(config.model, all_spins.reshape(-1,1), 16384) # Reshape to macth the updated unpack function
+            print("Checkpoint 1.7", flush=True)
             predicted_sign_structure = predicted_sign_structure.argmax(dim=1)
+            print("Checkpoint 1.8", flush=True)
             mask = correct_sign_structure == predicted_sign_structure
             accuracy = torch.sum(mask, dim=0).item() / all_spins.size(0)
             overlap = torch.dot(2 * mask.to(ground_state.dtype) - 1, ground_state ** 2)
@@ -436,144 +420,6 @@ def find_ground_state(config):
 
     # return 1 - np.abs(get_overlap()), best_energy
 
-
-def supervised_learning_test(config):
-    hamiltonian = config.hamiltonian
-    basis = hamiltonian.basis
-    try:
-        dtype = _get_dtype(config.model)  # _ removed
-    except AttributeError:
-        dtype = torch.float32
-    try:
-        device = _get_device(config.model)  # _ removed
-    except AttributeError:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ground_state = config.ground_state.to(device)
-    correct_sign_structure = torch.where(
-        ground_state >= 0.0,
-        torch.scalar_tensor(0, dtype=torch.int64, device=device),
-        torch.scalar_tensor(1, dtype=torch.int64, device=device),
-    )
-
-    sampled_power = 2
-    dataset_filename = os.path.join(config.output, "training_dataset.h5")
-    if os.path.exists(dataset_filename):
-        with h5py.File(dataset_filename, "r") as f:
-            spins = torch.from_numpy(np.asarray(f["/spins"])).to(device)
-            signs = torch.from_numpy(np.asarray(f["/signs"])).to(device)
-            counts = torch.from_numpy(np.asarray(f["/counts"])).to(device)
-    else:
-        config.model.eval()
-        log_psi = _make_log_coeff_fn(config.ground_state.abs(), config.model, basis, dtype, device)
-        with torch.no_grad():
-            p = config.ground_state.abs() ** sampled_power
-            p = p.numpy()
-            p /= np.sum(p)
-        if sampled_power is not None:
-            batch_indices = np.random.choice(
-                basis.number_states, size=config.number_monte_carlo_samples, replace=True, p=p
-            )
-        else:
-            batch_indices = np.random.choice(
-                basis.number_states, size=config.number_monte_carlo_samples, replace=False, p=None
-            )
-        logger.debug("[IGNORE ME] Sampled {} of the whole space...", np.sum(p[batch_indices]))
-        spins = basis.states[batch_indices]
-        # if True:
-        #     spins, _, _ = hamiltonian.batched_apply(spins)
-        #     spins, _, _ = hamiltonian.batched_apply(spins)
-        #     spins, _, _ = hamiltonian.batched_apply(spins)
-        #     spins = np.unique(spins, return_counts=False, axis=0)
-        #     sampled_power = None
-
-        spins, signs, counts = tune_sign_structure(
-            spins,
-            hamiltonian,
-            log_psi,
-            number_sweeps=config.number_sa_sweeps,
-            sampled_power=sampled_power,
-            device=device,
-        )
-        batch_indices = basis.batched_index(spins[:, 0]).astype(np.int64)
-        logger.debug("[IGNORE ME] Sampled {} of the whole space...", np.sum(p[batch_indices]))
-        probabilities = torch.from_numpy(p[batch_indices]).to(device)
-        probabilities /= torch.sum(probabilities)
-        batch_indices = torch.from_numpy(batch_indices).to(device)
-        mask = signs.to(device) == correct_sign_structure[batch_indices]
-        logger.debug("[IGNORE ME] Accuracy: {}", mask.sum() / batch_indices.size(0))
-        logger.debug("[IGNORE ME] Weighted accuracy: {}", torch.dot(mask.double(), probabilities))
-        with h5py.File(dataset_filename, "w") as f:
-            f["/spins"] = spins.view(np.int64)
-            f["/signs"] = signs.numpy()
-            f["/counts"] = counts
-        spins = torch.from_numpy(spins.view(np.int64))
-        counts = torch.from_numpy(counts)
-
-    weights = None
-    # with torch.no_grad():
-    #     if sampled_power is not None:
-    #         weights = None
-    #         # weights = torch.from_numpy(counts).to(dtype=dtype, device=device)
-    #         # weights /= torch.sum(weights)
-    #     else:
-    #         assert np.all(counts == 1)
-    #         weights = torch.from_numpy(p[batch_indices]).to(dtype=dtype, device=device)
-    #         weights /= torch.sum(weights)
-
-    logger.info("{}", torch.sum(1 - 2 * correct_sign_structure))
-    logger.info("{}", torch.dot(1 - 2 * correct_sign_structure.double(), ground_state ** 2))
-
-    def compute_metrics():
-        with torch.no_grad():
-            config.model.eval()
-            all_spins = torch.from_numpy(basis.states.view(np.int64)).to(device)
-            predicted_sign_structure = forward_with_batches(config.model, all_spins, 16384)
-            predicted_sign_structure = predicted_sign_structure.argmax(dim=1)
-            mask = correct_sign_structure == predicted_sign_structure
-            accuracy = torch.sum(mask, dim=0).item() / all_spins.size(0)
-            overlap = torch.dot(2 * mask.to(ground_state.dtype) - 1, ground_state ** 2)
-        return accuracy, overlap
-
-    tb_writer = SummaryWriter(log_dir=config.output)
-
-    def on_epoch_end(epoch, epochs, loss, accuracy=None):
-        if epoch % 100 == 0:
-            accuracy, overlap = compute_metrics()
-            tb_writer.add_scalar("loss", loss, epoch)
-            tb_writer.add_scalar("accuracy", accuracy, epoch)
-            tb_writer.add_scalar("overlap", overlap, epoch)
-            logger.debug(
-                "[{}/{}]: loss = {}, accuracy = {}, overlap = {}",
-                epoch,
-                epochs,
-                loss,
-                accuracy,
-                overlap,
-            )
-        else:
-            if accuracy is not None:
-                logger.debug("[{}/{}]: loss = {}, accuracy = {}", epoch, epochs, loss, accuracy)
-            tb_writer.add_scalar("loss", loss, epoch)
-
-    accuracy, overlap = compute_metrics()
-    logger.debug("Accuracy: {}; overlap: {}", accuracy, overlap)
-    optimizer = config.optimizer(config.model)
-    scheduler = config.scheduler(optimizer)
-    tune_neural_network(
-        config.model,
-        spins,
-        signs,
-        weights,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        epochs=config.number_supervised_epochs,
-        batch_size=config.train_batch_size,
-        on_epoch_end=on_epoch_end,
-    )
-
-    # return 1 - np.abs(get_overlap()), best_energy
-
-
 class Mish(torch.nn.Module):
     def __init__(self):
         super(Mish, self).__init__()
@@ -637,8 +483,7 @@ class EmbeddingConv(torch.nn.Module):
         dim2 = self.layout.size()[1]
         layout = self.layout.view(dim1*dim2)
 
-#        x = unpack_bits.unpack(x, self.number_physical_spins)
-        x = nqs.unpack(x, self.number_physical_spins)
+        x = unpack_bits.unpack(x, self.number_physical_spins)
         zeros = torch.zeros(x.size()[0], 1).to(x.device)
 
         x = torch.cat((x, zeros), 1)
@@ -679,12 +524,10 @@ class ConvModel(torch.nn.Module):
 
     def forward(self, x):
         number_spins = self.shape[0] * self.shape[1]
-#        x = unpack_bits.unpack(x, number_spins)
-        x = nqs.unpack(x, number_spins)
+        x = unpack_bits.unpack(x, number_spins)
         x = self.layers(x.view(-1, 1, *self.shape))
         x = self.tail(x.view(x.size(0), -1))
         return x
-
 
 class DenseModel(torch.nn.Module):
     def __init__(self, shape, number_features, use_batchnorm=True, dropout=None):
@@ -705,10 +548,7 @@ class DenseModel(torch.nn.Module):
 
     def forward(self, x):
         number_spins = self.shape[0] * self.shape[1]
-#        x = unpack_bits.unpack(x, number_spins)
-        x = nqs.unpack(x, number_spins)
-#        print("Managed to unpack", self.layers(x).size())
-
+        x = unpack_bits.unpack(x, number_spins)   
         return self.layers(x)
 
 class AugmentedModel(torch.nn.Module):
@@ -730,8 +570,7 @@ class AugmentedModel(torch.nn.Module):
 
     def forward(self, x):
         number_spins = self.shape[0] * self.shape[1]
-#        x = unpack_bits.unpack(x, number_spins)
-        x = nqs.unpack(x, number_spins)
+        x = unpack_bits.unpack(x, number_spins)
         x = torch.einsum('ij,ik->ijk', x, x)
         x = torch.reshape(x,(len(x), number_spins**2))
         return self.layers(x)
@@ -753,8 +592,7 @@ if False:
 
         def forward(self, x):
             if x.dtype == torch.int64:
-#                x = unpack_bits.unpack(x, self.shape[0] * self.shape[1])
-                x = nqs.unpack(x, self.shape[0] * self.shape[1])
+                x = unpack_bits.unpack(x, self.shape[0] * self.shape[1])
             # x = x.view(x.size(0), self.shape[0] * self.shape[1])
             mask = self.mask.to(dtype=x.dtype, device=x.device)
             bias = ((self.shape[0] * self.shape[1] - (x * mask).sum(dim=1)) // 2) % 2
@@ -795,8 +633,7 @@ if False:
 
         def forward(self, x):
             number_spins = self.shape[0] * self.shape[1]
-#            input = unpack_bits.unpack(x, number_spins)
-            input = nqs.unpack(x, number_spins)
+            input = unpack_bits.unpack(x, number_spins)
             x = input.view(input.size(0), 1, *self.shape)
             x = self.layers(x)
             # x = x.view(x.size(0), x.size(1), -1).mean(dim=2)
@@ -841,8 +678,7 @@ if False:
 
         #    @torch.jit.script_method
         def forward(self, x):
-#            x = unpack_bits.unpack(x, self._shape[0] * self._shape[1])
-            x = nqs.unpack(x, self._shape[0] * self._shape[1])
+            x = unpack_bits.unpack(x, self._shape[0] * self._shape[1])
             x = x.view((x.shape[0], 1, *self._shape))
             x = pad_circular(x, self._padding)
             x = self._conv1(x)
@@ -969,96 +805,3 @@ def run_triangle_6x6():
     find_ground_state(config)
     print("Checkpoint 9", flush=True)
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sweeps", type=int, help="Number of SA sweeps.")
-    parser.add_argument("--samples", type=int, help="Number MC samples.")
-    parser.add_argument("--epochs", type=int, help="Number epochs.")
-    parser.add_argument("--iters", type=int, help="Number outer iterations.")
-    parser.add_argument("--batch-size", type=int, help="Training batch size.")
-    parser.add_argument("--w1", type=int, help="1st layer's width.")
-    parser.add_argument("--w2", type=int, help="2nd layer's width.")
-    parser.add_argument("--w3", type=int, help="3rd layer's width.")
-    parser.add_argument("--seed", type=int, help="Seed.")
-    parser.add_argument("--device", type=str, help="Device.")
-    args = parser.parse_args()
-
-    ground_state, E, representatives = load_ground_state(
-        os.path.join(project_dir(), "../../data/symmetric_pyrochlore/pyrochlore.h5")
-    )
-    basis, hamiltonian = load_basis_and_hamiltonian(
-        os.path.join(project_dir(), "../../data/symmetric_pyrochlore/pyrochlore.yaml")
-    )
-    basis.build(representatives)
-    representatives = None
-    logger.info("Hilbert space dimension is {}", basis.number_states)
-
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    logger.info("Using seed={}", args.seed)
-
-    device = torch.device(args.device)  # "cuda" if torch.cuda.is_available() else "cpu")
-    # model = Net((4, 6), 28, 28, 20, window=5) #.to(device)
-    # model = Phase((6, 6), number_channels=[32, 32, 32], kernel_size=5).to(device)
-    # model = MarshallSignRule((6, 6)).to(device)
-    # model = Phase((6, 6), number_channels=[64, 64], kernel_size=5).to(device)
-    # model.scale = 0.0
-    widths = [args.w1]
-    if args.w2 is not None:
-        widths.append(args.w2)
-    if args.w3 is not None:
-        widths.append(args.w3)
-    widths.append(2)
-    layers = [nqs.Unpack(basis.number_spins), torch.nn.Linear(basis.number_spins, args.w1)]
-    for i in range(1, len(widths)):
-        layers += [
-            torch.nn.ReLU(),
-            torch.nn.BatchNorm1d(widths[i - 1]),
-            torch.nn.Linear(widths[i - 1], widths[i]),
-        ]
-
-    model = torch.nn.Sequential(*layers).to(device)
-    logger.info(model)
-    #     nqs.Unpack(basis.number_spins),
-    #     torch.nn.Linear(basis.number_spins, args.w1),
-    #     torch.nn.ReLU(),
-    #     torch.nn.BatchNorm1d(args.w1),
-    #     torch.nn.Linear(args.w1, args.w2),
-    #     torch.nn.ReLU(),
-    #     torch.nn.BatchNorm1d(args.w2),
-    #     torch.nn.Linear(args.w2, 2, bias=False),
-    # ).to(device)
-    # model = CombinedModel((6, 6), model)
-    # model.load_state_dict(torch.load("runs/6x6/075/model_3.pt"))
-    # model = torch.jit.script(model)
-    logger.info("Model contains {} parameters", sum(t.numel() for t in model.parameters()))
-
-    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    config = Config(
-        model=model,
-        ground_state=ground_state,
-        hamiltonian=hamiltonian,
-        number_sa_sweeps=args.sweeps,
-        number_supervised_epochs=args.epochs,
-        number_monte_carlo_samples=args.samples,
-        number_outer_iterations=args.iters,
-        train_batch_size=args.batch_size,
-        # lambda m: torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5),
-        # Settings for 64->64->64->64 with k=5
-        # optimizer=lambda m: torch.optim.SGD(model.parameters(), lr=4e-2, momentum=0.95),
-        optimizer=lambda m: torch.optim.AdamW(model.parameters(), lr=1e-3),  # , momentum=0.9),
-        scheduler=lambda o: torch.optim.lr_scheduler.CosineAnnealingLR(
-            o, T_max=args.epochs, eta_min=1e-4
-        ),
-        # optimizer=lambda m: torch.optim.AdamW(model.parameters(), lr=1e-3), # , momentum=0.9),
-        # torch.optim.SGD(model.parameters(), lr=2e-2, momentum=0.95), # , momentum=0.9),
-        # torch.optim.AdamW(model.parameters(), lr=1e-3), # , momentum=0.9),
-        # scheduler=lambda o: None,
-        # torch.optim.lr_scheduler.CosineAnnealingLR(o, T_max=300, eta_min=5e-4),
-        device=device,
-        output="../run/{}".format(args.seed),
-    )
-    os.makedirs(config.output, exists_ok=True)
-    # supervised_learning_test(config)
-    find_ground_state(config)
