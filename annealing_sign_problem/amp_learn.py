@@ -1,557 +1,118 @@
-import argparse
-from .common import *
-import ctypes
+# Copyright Tom Westerhout (c) 2020-2021
+#
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#
+#     * Redistributions in binary form must reproduce the above
+#       copyright notice, this list of conditions and the following
+#       disclaimer in the documentation and/or other materials provided
+#       with the distribution.
+#
+#     * Neither the name of Tom Westerhout nor the names of other
+#       contributors may be used to endorse or promote products derived
+#       from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 from collections import namedtuple
-from typing import Tuple
-import lattice_symmetries as ls
-import nqs_playground as nqs
-from nqs_playground.core import _get_dtype, _get_device
+import time
+import os
+from loguru import logger
+import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
-from typing import Optional
-import time
-from loguru import logger
-import sys
-import numpy as np
-import concurrent.futures
 
-
-class TensorIterableDataset(torch.utils.data.IterableDataset):
-    def __init__(self, *tensors, batch_size=1, shuffle=False):
-        assert all(tensors[0].size(0) == tensor.size(0) for tensor in tensors)
-        assert all(tensors[0].device == tensor.device for tensor in tensors)
-        self.tensors = tensors
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-
-    @property
-    def device(self):
-        return self.tensors[0].device
-
-    def __len__(self):
-        return self.tensors[0].size(0)
-
-    def __iter__(self):
-        if self.shuffle:
-            indices = torch.randperm(self.tensors[0].size(0), device=self.device)
-            tensors = tuple(tensor[indices] for tensor in self.tensors)
-        else:
-            tensors = self.tensors
-        return zip(*(torch.split(tensor, self.batch_size) for tensor in tensors))
-
-
-def supervised_loop_once(dataset, model, optimizer, scheduler, loss_fn):
-    tick = time.time()
-    model.train()
-    total_loss = 0
-    total_count = 0
-    for batch in dataset:
-        (x, y, w) = batch
-        w = w / torch.sum(w)
-        optimizer.zero_grad()
-        ŷ = model(x)
-        loss = loss_fn(ŷ, y, w)
-        loss.backward()
-        optimizer.step()
-        total_loss += x.size(0) * loss.item()
-        total_count += x.size(0)
-    if scheduler is not None:
-        scheduler.step()
-    tock = time.time()
-    return {"loss": total_loss / total_count, "time": tock - tick}
-
-
-@torch.no_grad()
-def compute_average_loss(dataset, model, loss_fn, accuracy_fn):
-    tick = time.time()
-    model.eval()
-    total_loss = 0
-    total_sum = 0
-    total_count = 0
-    for batch in dataset:
-        (x, y, w) = batch
-        w = w / torch.sum(w)
-        ŷ = model(x)
-        loss = loss_fn(ŷ, y, w)
-        accuracy = accuracy_fn(ŷ, y, w)
-        total_loss += x.size(0) * loss.item()
-        total_sum += x.size(0) * accuracy.item()
-        total_count += x.size(0)
-    tock = time.time()
-    return {
-        "loss": total_loss / total_count,
-        "accuracy": total_sum / total_count,
-        "time": tock - tick,
-    }
-
-
-def prepare_datasets(
-    spins: Tensor,
-    target_signs: Tensor,
-    weights: Optional[Tensor],
-    device: torch.device,
-    dtype: torch.dtype,
-    train_batch_size: int,
-    inference_batch_size: int = 16384,
-):
-    spins = spins.to(device)
-    target_signs = target_signs.to(device)
-    if weights is None:
-        weights = torch.ones_like(target_signs, device=device, dtype=dtype)
-    data = (spins, target_signs, weights)
-    train_dataset = TensorIterableDataset(*data, batch_size=train_batch_size, shuffle=True)
-    test_dataset = TensorIterableDataset(*data, batch_size=inference_batch_size, shuffle=False)
-    return train_dataset, test_dataset
-
-
-def default_on_epoch_end(epoch, epochs, loss, accuracy=None):
-    if epoch % 10 == 0:
-        args = (epoch, epochs, loss)
-        s = "[{}/{}]: loss = {}"
-        if accuracy is not None:
-            s += ", accuracy = {}"
-            args = args + (accuracy,)
-        logger.debug(s, *args)
-
-
-def tune_neural_network(
-    model: torch.nn.Module,
-    spins: Tensor,
-    target_signs: Tensor,
-    weights: Optional[Tensor],
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    epochs: int,
-    batch_size: int,
-    on_epoch_end=default_on_epoch_end,
-):
-    logger.info("Starting supervised training...")
-    dtype = _get_dtype(model)
-    device = _get_device(model)
-    train_dataset, test_dataset = prepare_datasets(
-        spins, target_signs, weights, device=device, dtype=dtype, train_batch_size=batch_size
-    )
-    logger.info("Training dataset contains {} samples", spins.size(0))
-
-    with open("dataset_size.txt", "a") as f:
-        np.savetxt(f, [spins.size(0)])
-        f.close()
-
-    def loss_fn(ŷ, y, w):
-        """Weighted Cross Entropy"""
-        r = torch.nn.functional.cross_entropy(ŷ, y, reduction="none")
-        return torch.dot(r, w)
-
-    @torch.no_grad()
-    def accuracy_fn(ŷ, y, w):
-        r = (ŷ.argmax(dim=1) == y).to(w.dtype)
-        return torch.dot(r, w)
-
-    info = compute_average_loss(test_dataset, model, loss_fn, accuracy_fn)
-    on_epoch_end(0, epochs, info["loss"], info["accuracy"])
-    for epoch in range(epochs):
-        info = supervised_loop_once(train_dataset, model, optimizer, scheduler, loss_fn)
-        if epoch != epochs - 1:
-            on_epoch_end(epoch + 1, epochs, info["loss"])
-    info = compute_average_loss(test_dataset, model, loss_fn, accuracy_fn)
-    on_epoch_end(epochs, epochs, info["loss"], info["accuracy"])
-
-
-def _extract_classical_model_with_exact_fields(
-    spins, hamiltonian, ground_state, sampled_power, device
-):
-    basis = hamiltonian.basis
-    log_amplitude = ground_state.abs().log().unsqueeze(dim=1)
-    log_sign = torch.where(
-        ground_state >= 0,
-        torch.scalar_tensor(0, device=device, dtype=ground_state.dtype),
-        torch.scalar_tensor(np.pi, device=device, dtype=ground_state.dtype),
-    ).unsqueeze(dim=1)
-
-    @torch.no_grad()
-    def log_coeff_fn(spin: Tensor) -> Tensor:
-        spin = spin.cpu().numpy().view(np.uint64)
-        if spin.ndim > 1:
-            spin = spin[:, 0]
-        indices = torch.from_numpy(ls.batched_index(basis, spin).view(np.int64)).to(device)
-        a = log_amplitude[indices]
-        b = log_sign[indices]
-        return torch.complex(a, b)
-
-    return extract_classical_ising_model(
-        spins,
-        hamiltonian,
-        log_coeff_fn,
-        sampled_power=sampled_power,
-        device=device,
-    )
-
-
-def tune_sign_structure(
-    spins: np.ndarray,
-    hamiltonian: ls.Operator,
-    log_psi: torch.nn.Module,
-    number_sweeps: int,
-    seed: Optional[int] = None,
-    beta0: Optional[int] = None,
-    beta1: Optional[int] = None,
-    sampled_power: Optional[int] = None,
-    device: Optional[torch.device] = None,
-    scale_field=None,
-    ground_state=None,
-):
-    spins0 = spins
-    h, spins, x0, counts = extract_classical_ising_model(
-        spins0,
-        hamiltonian,
-        log_psi,
-        sampled_power=sampled_power,
-        device=device,
-        scale_field=scale_field,
-    )
-    x, _, e = sa.anneal(h, x0, seed=seed, number_sweeps=number_sweeps, beta0=beta0, beta1=beta1)
-    if ground_state is not None:
-        h_exact, _, x0_exact, _ = _extract_classical_model_with_exact_fields(
-            spins0,
-            hamiltonian,
-            ground_state,
-            sampled_power=sampled_power,
-            device=device,
-        )
-        # x_with_exact, _, e_with_exact = sa.anneal(
-        #     h_exact, x0, seed=seed, number_sweeps=number_sweeps, beta0=beta0, beta1=beta1
-        # )
-
-    def extract_signs(bits):
-        i = np.arange(spins.shape[0], dtype=np.uint64)
-        signs = (bits[i // 64] >> (i % 64)) & 1
-        signs = 1 - signs
-        signs = torch.from_numpy(signs.view(np.int64))
-        return signs
-
-    signs = extract_signs(x)
-    signs0 = extract_signs(x0)
-    if ground_state is not None:
-        signs0_exact = extract_signs(x0_exact)
-        # signs_with_exact = extract_signs(x_with_exact)
-        # accuracy_with_exact = torch.sum(signs0_exact == signs_with_exact).float() / spins.shape[0]
-        accuracy_normal = torch.sum(signs0_exact == signs).float() / spins.shape[0]
-        # logger.debug("SA accuracy with exact fields: {}", accuracy_with_exact)
-        logger.debug("SA accuracy with approximate fields: {}", accuracy_normal)
-
-        with open("SA_accuracy.txt", "a") as f2:
-            np.savetxt(f2, [max(accuracy_normal, 1 - accuracy_normal)])
-            f2.close()
-
-    if False:  # NOTE: disabling for now
-        if torch.sum(signs == signs0).float() / spins.shape[0] < 0.5:
-            logger.warning("Applying global sign flip...")
-            signs = 1 - signs
-#    return spins, signs, counts
-    return spins, signs0_exact, counts
-
+from . import *
 
 Config = namedtuple(
     "Config",
     [
-        "model",
-        "ground_state",
+        "amplitude",
+        "phase",
         "hamiltonian",
-        "number_sa_sweeps",
-        "number_supervised_epochs",
-        "number_monte_carlo_samples",
-        "number_outer_iterations",
-        "train_batch_size",
+        "output",
+        "epochs",
+        "sampling_options",
         "optimizer",
         "scheduler",
-        "device",
-        "output",
+        "exact",
+        "constraints",
+        "inference_batch_size",
+        "checkpoint_every",
     ],
+    defaults=[],
 )
 
 
-def _make_log_coeff_fn(amplitude, sign, basis, dtype, device):
+def _should_optimize(module):
+    return any(map(lambda p: p.requires_grad, module.parameters()))
 
-    print("No problem 1", flush=True)
+class Runner(RunnerBase):
+    def __init__(self, config):
+        super().__init__(config)
+        self.combined_state = combine_amplitude_and_phase(
+            self.config.amplitude, self.config.phase, use_jit=False
+        )
 
-    assert isinstance(amplitude, Tensor)
-    assert isinstance(sign, torch.nn.Module)
-    log_amplitude = amplitude.log().unsqueeze(dim=1)
+    def inner_iteration(self, states, log_probs, weights):
+        assert weights.dtype == torch.float64
+        assert log_probs.dtype == torch.float64
+        logger.info("Inner iteration...")
+        tick = time.time()
+        E = self.compute_local_energies(states, weights)
+        E = E.real.to(dtype=weights.dtype)
+        states = states.view(-1, states.size(-1))
+        log_probs = states.view(-1)
+        weights = weights.view(-1)
 
-    print("No problem 1.1", flush=True)
-
-    log_amplitude = log_amplitude.to(device=device, dtype=dtype)
-
-    print("No problem 2", flush=True)
-
-    @torch.no_grad()
-    def log_coeff_fn(spin: Tensor) -> Tensor:
-        b = np.pi * sign(spin).argmax(dim=1, keepdim=True).to(dtype)
-        spin = spin.cpu().numpy().view(np.uint64)
-        if spin.ndim > 1:
-            spin = spin[:, 0]
-        indices = torch.from_numpy(ls.batched_index(basis, spin).view(np.int64)).to(device)
-        a = log_amplitude[indices]
-        return torch.complex(a, b)
-
-    print("No problem 3", flush=True)
-
-    return log_coeff_fn
-
-
-def _make_log_amplitude_fn(amplitude, basis, device, dtype):
-    assert isinstance(amplitude, Tensor)
-    log_amplitude = amplitude.log().unsqueeze(dim=1)
-    log_amplitude = log_amplitude.to(device=device, dtype=dtype)
-
-    @torch.no_grad()
-    def log_coeff_fn(spin: Tensor) -> Tensor:
-        spin = spin.cpu().numpy().view(np.uint64)
-        if spin.ndim > 1:
-            spin = spin[:, 0]
-        indices = torch.from_numpy(ls.batched_index(basis, spin).view(np.int64)).to(device)
-        return log_amplitude[indices]
-
-    return log_coeff_fn
-
-
-def find_ground_state(config):
-    hamiltonian = config.hamiltonian
-    basis = hamiltonian.basis
-    # all_spins = torch.from_numpy(basis.states.view(np.int64))
-    try:
-        dtype = _get_dtype(config.model)
-    except AttributeError:
-        dtype = torch.float32
-    try:
-        device = _get_device(config.model)
-    except AttributeError:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    print("Checkpoint 1.1", flush=True)
-
-    log_psi = _make_log_coeff_fn(config.ground_state.abs(), config.model, basis, dtype, device)
-    sampled_power = 2.0  # True
-
-    print("Checkpoint 1.1.1", flush=True)
-
-    with torch.no_grad():
-        p = config.ground_state.abs() ** sampled_power
-        p = p.numpy()
-        p /= np.sum(p)
-
-    print("Checkpoint 1.2", flush=True)
-
-    ground_state = config.ground_state.to(device)
-    correct_sign_structure = torch.where(
-        ground_state >= 0.0,
-        torch.scalar_tensor(0, dtype=torch.int64, device=device),
-        torch.scalar_tensor(1, dtype=torch.int64, device=device),
-    )
-
-    print("Checkpoint 1.3", flush=True)
-
-    def compute_metrics():
+        # Compute output gradient
         with torch.no_grad():
-            config.model.eval()
-            all_spins = torch.from_numpy(basis.states.view(np.int64)).to(device)
-            predicted_sign_structure = forward_with_batches(config.model, all_spins, 16384)
-            predicted_sign_structure = predicted_sign_structure.argmax(dim=1)
-            mask = correct_sign_structure == predicted_sign_structure
-            accuracy = torch.sum(mask, dim=0).item() / all_spins.size(0)
-            overlap = torch.dot(2 * mask.to(ground_state.dtype) - 1, ground_state ** 2)
-        return accuracy, overlap
+            grad = E - torch.dot(E, weights)
+            grad *= 2 * weights
+            grad = grad.view(-1, 1)
+            grad_norm = torch.linalg.norm(grad)
+            logger.info("‖∇E‖₂ = {}", grad_norm)
+            self.tb_writer.add_scalar("loss/grad", grad_norm, self.global_index)
 
-    print("Checkpoint 1.4", flush=True)
+        self.config.optimizer.zero_grad()
+        batch_size = self.config.inference_batch_size
 
-    accuracy, overlap = compute_metrics()
-    logger.info("Accuracy = {}, overlap = {}", accuracy, overlap)
+        # Computing gradients for the amplitude network
+        logger.info("Computing gradients...")
+        if _should_optimize(self.config.amplitude):
+            self.config.amplitude.train()
+            forward_fn = self.amplitude_forward_fn
+            for (states_chunk, grad_chunk) in split_into_batches((states, grad), batch_size):
+                output = forward_fn(states_chunk)
+                output.backward(grad_chunk) # , retain_graph=True)
 
-    # scale_field = [0, 0] + [None for _ in range(config.number_outer_iterations - 2)]
-    scale_field = [0] + [None for _ in range(config.number_outer_iterations)]
-    for i in range(config.number_outer_iterations):
-        logger.info("Starting outer iteration {}...", i + 1)
-        if sampled_power is not None:
-            batch_indices = np.random.choice(
-                basis.number_states, size=config.number_monte_carlo_samples, replace=True, p=p
-            )
-        else:
-            batch_indices = np.random.choice(
-                basis.number_states, size=config.number_monte_carlo_samples, replace=False, p=None
-            )
+        # Computing gradients for the phase network
+        if _should_optimize(self.config.phase):
+            self.config.phase.train()
+            forward_fn = self.config.phase
+            for (states_chunk, grad_chunk) in split_into_batches((states, grad), batch_size):
+                output = forward_fn(states_chunk)
+                output.backward(grad_chunk)
 
-        spins = basis.states[batch_indices]
-        spins, signs, counts = tune_sign_structure(
-            spins,
-            hamiltonian,
-            log_psi,
-            number_sweeps=config.number_sa_sweeps,
-            sampled_power=sampled_power,
-            device=device,
-            scale_field=scale_field[i],
-            ground_state=ground_state,
-        )
-        with torch.no_grad():
-            if sampled_power is not None:
-                weights = None
-                # weights = torch.from_numpy(counts).to(dtype=dtype, device=device)
-                # weights /= torch.sum(weights)
-            else:
-                assert np.all(counts == 1)
-                weights = torch.from_numpy(p[batch_indices]).to(dtype=dtype, device=device)
-                weights /= torch.sum(weights)
-        spins = torch.from_numpy(spins.view(np.int64))
-        optimizer = config.optimizer(config.model)
-        scheduler = config.scheduler(optimizer)
-        tune_neural_network(
-            config.model,
-            spins,
-            signs,
-            weights,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            epochs=config.number_supervised_epochs,
-            batch_size=config.train_batch_size,
-        )
-        torch.save(
-            config.model.state_dict(), os.path.join(config.output, "model_{}.pt".format(i + 1))
-        )
-        accuracy, overlap = compute_metrics()
-        logger.info("Accuracy = {}, overlap = {}", accuracy, overlap)
-
-        with open("accuracies.txt", "a") as f3:
-            np.savetxt(f3, [max(accuracy, 1 - accuracy)])
-            f3.close()
-
-        with open("overlaps.txt", "a") as f4:
-            np.savetxt(f4, [overlap.cpu()])
-            f4.close()
-
-    # return 1 - np.abs(get_overlap()), best_energy
-
-class Mish(torch.nn.Module):
-    def __init__(self):
-        super(Mish, self).__init__()
-
-    def forward(self, input: Tensor) -> Tensor:
-        return input * torch.tanh(torch.nn.functional.softplus(input))
-
-
-class ConvBlock(torch.nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3):
-        super().__init__()
-        self.layer = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                padding=0,
-            ),
-            # Mish(),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.BatchNorm2d(out_channels),
-            # torch.nn.MaxPool1d(kernel_size=2),
-        )
-        self.kernel_size = kernel_size
-
-    def forward(self, x):
-        k = self.kernel_size
-        x = torch.cat([x[:, :, -((k - 1) // 2) :, :], x, x[:, :, : k // 2, :]], dim=2)
-        x = torch.cat([x[:, :, :, -((k - 1) // 2) :], x, x[:, :, :, : k // 2]], dim=3)
-        return self.layer(x)
-
-class DenseModel(torch.nn.Module):
-    def __init__(self, shape, number_features, use_batchnorm=True, dropout=None):
-        super().__init__()
-        number_blocks = len(number_features)
-        number_features = number_features + [2]
-        layers = [torch.nn.Linear(shape[0] * shape[1], number_features[0])]
-        for i in range(1, len(number_features)):
-            layers.append(torch.nn.ReLU(inplace=True))
-            if use_batchnorm:
-                layers.append(torch.nn.BatchNorm1d(number_features[i - 1]))
-            if dropout is not None:
-                layers.append(torch.nn.Dropout(p=dropout, inplace=True))
-            layers.append(torch.nn.Linear(number_features[i - 1], number_features[i]))
-
-        self.shape = shape
-        self.layers = torch.nn.Sequential(*layers)
-
-    def forward(self, x):
-        number_spins = self.shape[0] * self.shape[1]
-        x = nqs.unpack(x, number_spins)
-        return self.layers(x)
-
-def amp_runner():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sweeps", type=int, default=10000, help="Number of SA sweeps.")
-    parser.add_argument("--samples", type=int, default=30000, help="Number MC samples.")
-    parser.add_argument("--epochs", type=int, default=200, help="Number supervised epochs.")
-    parser.add_argument("--iters", type=int, default=100, help="Number outer iterations.")
-    parser.add_argument("--batch-size", type=int, default=256, help="Training batch size.")
-    parser.add_argument("--seed", type=int, default=None, help="Seed.")
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--momentum", type=float, default=0.95)
-    parser.add_argument("--device", type=str, default=None, help="Device.")
-    parser.add_argument("--widths", type=str, required=True, help="Layer widths.")
-    parser.add_argument("--kernels", type=str, help="Layer widths.")
-    args = parser.parse_args()
-
-    with open("chain_length.txt", "a") as f5:
-        np.savetxt(f5, [args.samples])
-        f5.close()
-
-    ground_state, E, representatives = load_ground_state(
-        os.path.join(project_dir(), "../../annealing-sign-problem/data/symmetric_pyrochlore/pyrochlore.h5")
-    )
-    basis, hamiltonian = load_basis_and_hamiltonian(
-        os.path.join(project_dir(), "../../annealing-sign-problem/data/symmetric_pyrochlore/pyrochlore.yaml")
-    )
-
-    basis.build(representatives)
-    representatives = None
-    logger.debug("Hilbert space dimension is {}", basis.number_states)
-
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed + 1)
-        logger.debug("Seeding PyTorch and NumPy with seed={}...", args.seed)
-
-    if args.device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-
-    widths = eval(args.widths)
-    if args.kernels is not None:
-        kernel_size = eval(args.kernels)
-    else:
-        kernel_size = 4
-
-    print(device)
-    model = DenseModel((4, 8), number_features=widths, use_batchnorm=True, dropout=None).to(device)
-    logger.info(model)
-    logger.debug("Contains {} parameters", sum(t.numel() for t in model.parameters()))
-
-    #optimizer=lambda m: torch.optim.AdamW(model.parameters(), lr=args.lr)
-    #scheduler=lambda o: None
-    optimizer=lambda m: torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
-    scheduler=lambda o: torch.optim.lr_scheduler.CosineAnnealingLR(o, T_max=args.epochs, eta_min=2e-4)
-    config = Config(
-        model=model,
-        ground_state=ground_state,
-        hamiltonian=hamiltonian,
-        number_sa_sweeps=args.sweeps,
-        number_supervised_epochs=args.epochs,
-        number_monte_carlo_samples=args.samples,
-        number_outer_iterations=args.iters,
-        train_batch_size=args.batch_size,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        output="run/{}".format(args.seed if args.seed is not None else "dummy"),
-    )
-
-    os.makedirs(config.output, exist_ok=True)
-    find_ground_state(config)
+        self.config.optimizer.step()
+        if self.config.scheduler is not None:
+            self.config.scheduler.step()
+        self.checkpoint(init={"optimizer": self.config.optimizer.state_dict()})
+        tock = time.time()
+        logger.info("Completed inner iteration in {:.1f} seconds!", tock - tick)

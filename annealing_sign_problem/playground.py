@@ -2,9 +2,20 @@ import numpy as np
 import torch
 import yaml
 import nqs_playground as nqs
+import nqs_playground.sgd as sgd
+import nqs_playground.core as core
 import lattice_symmetries as ls
 import h5py
 import unpack_bits
+
+from collections import namedtuple
+import time
+import os
+from loguru import logger
+from torch import Tensor
+from torch.utils.tensorboard import SummaryWriter
+
+#from . import *
 
 class DenseModel(torch.nn.Module):
     def __init__(self, shape, number_features, use_batchnorm=True, dropout=None):
@@ -43,8 +54,7 @@ def load_basis_and_hamiltonian(filename: str):
     hamiltonian = ls.Operator.load_from_yaml(config["hamiltonian"], basis)
     return basis, hamiltonian
 
-def combine_amplitude_and_sign(
-     *modules, apply_log: bool = False, out_dim: int = 1, use_jit: bool = True
+def combine_amplitude_and_sign(*modules, apply_log: bool = False, out_dim: int = 1, use_jit: bool = True
  ) -> torch.nn.Module:
      r"""Combines two torch.nn.Modules representing amplitudes and signs of the
      wavefunction coefficients into one model.
@@ -134,6 +144,83 @@ def vector_to_module(vector: torch.Tensor, basis) -> torch.nn.Module:
 
     sign_module = SignModule(vector, basis)
     return sign_module
+
+Config = namedtuple(
+    "Config",
+    [
+        "amplitude",
+        "phase",
+        "hamiltonian",
+        "output",
+        "epochs",
+        "sampling_options",
+        "optimizer",
+        "scheduler",
+        "exact",
+        "constraints",
+        "inference_batch_size",
+#        "checkpoint_every",
+    ],
+    defaults=[],
+)
+
+
+def _should_optimize(module):
+    return any(map(lambda p: p.requires_grad, module.parameters()))
+
+class Runner(nqs.RunnerBase):
+    def __init__(self, config):
+        super().__init__(config)
+        self.combined_state = combine_amplitude_and_explicit_sign(
+            self.config.amplitude, self.config.phase, use_jit=False
+        )
+
+    def inner_iteration(self, states, log_probs, weights):
+        assert weights.dtype == torch.float64
+        assert log_probs.dtype == torch.float64
+        logger.info("Inner iteration...")
+        tick = time.time()
+        E = self.compute_local_energies(states, weights)
+        E = E.real.to(dtype=weights.dtype)
+        states = states.view(-1, states.size(-1))
+        log_probs = states.view(-1)
+        weights = weights.view(-1)
+
+        # Compute output gradient
+        with torch.no_grad():
+            grad = E - torch.dot(E, weights)
+            grad *= 2 * weights
+            grad = grad.view(-1, 1)
+            grad_norm = torch.linalg.norm(grad)
+            logger.info("‖∇E‖₂ = {}", grad_norm)
+            self.tb_writer.add_scalar("loss/grad", grad_norm, self.global_index)
+
+        self.config.optimizer.zero_grad()
+        batch_size = self.config.inference_batch_size
+
+        # Computing gradients for the amplitude network
+        logger.info("Computing gradients...")
+        if _should_optimize(self.config.amplitude):
+            self.config.amplitude.train()
+            forward_fn = self.amplitude_forward_fn
+            for (states_chunk, grad_chunk) in core.split_into_batches((states, grad), batch_size):
+                output = forward_fn(states_chunk)
+                output.backward(grad_chunk) # , retain_graph=True)
+
+        # Computing gradients for the phase network
+#        if _should_optimize(self.config.phase):
+#            self.config.phase.train()
+#            forward_fn = self.config.phase
+#            for (states_chunk, grad_chunk) in core.split_into_batches((states, grad), batch_size):
+#                output = forward_fn(states_chunk)
+#                output.backward(grad_chunk)
+
+        self.config.optimizer.step()
+        if self.config.scheduler is not None:
+            self.config.scheduler.step()
+        self.checkpoint(init={"optimizer": self.config.optimizer.state_dict()})
+        tock = time.time()
+        logger.info("Completed inner iteration in {:.1f} seconds!", tock - tick)
           
 def main():
     number_spins = 32
@@ -167,5 +254,30 @@ def main():
 
     local_en = nqs.local_values(torch_spins, hamiltonian, combined_state)
     print(local_en)
+
+    optimizer = torch.optim.SGD(
+        list(combined_state.parameters()),
+        lr=1e-1,
+        momentum=0.9,
+        weight_decay=1e-4,
+    )
+    # optimizer = torch.optim.Adam(list(amplitude.parameters()) + list(phase.parameters()), lr=1e-2)
+    options = Config(
+        amplitude=amplitude,
+        phase=getting_sign,
+        hamiltonian=hamiltonian,
+        output="test.result",
+        epochs=10,
+        sampling_options=nqs.SamplingOptions(number_samples=1200, number_chains=10, mode='exact'),
+#        sampling_mode="exact",
+        exact=None,  # ground_state[:, 0],
+        constraints={"hamming_weight": lambda i: 0.1},
+        optimizer=optimizer,
+        scheduler=None,
+        inference_batch_size=8192,
+    )
+
+    runner = Runner(options)
+    runner.run(1)
 
 main()
