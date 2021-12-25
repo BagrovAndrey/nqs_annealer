@@ -15,8 +15,6 @@ from loguru import logger
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
-#from . import *
-
 class DenseModel(torch.nn.Module):
     def __init__(self, shape, number_features, use_batchnorm=True, dropout=None):
         super().__init__()
@@ -142,7 +140,6 @@ Config = namedtuple(
         "exact",
         "constraints",
         "inference_batch_size",
-#        "checkpoint_every",
     ],
     defaults=[],
 )
@@ -171,15 +168,6 @@ class Runner(nqs.RunnerBase):
         states = states.view(-1, states.size(-1))
         log_probs = states.view(-1)
         weights = weights.view(-1)
-
-# Incoherent piece to be fixed
-
-#        all_spins = torch.from_numpy(basis.states.view(np.int64)).to(device)
-#        predicted_sign_structure = core.forward_with_batches(config.model, all_spins, 16384)
-#        predicted_sign_structure = predicted_sign_structure.argmax(dim=1)
-#        mask = correct_sign_structure == predicted_sign_structure
-#        accuracy = torch.sum(mask, dim=0).item() / all_spins.size(0)
-#        overlap = torch.dot(2 * mask.to(ground_state.dtype) - 1, ground_state ** 2)
 
         # Compute output gradient
         with torch.no_grad():
@@ -230,18 +218,9 @@ def main():
     ground_state, E, representatives = load_ground_state("square_24_periodic.h5")
     sign_structure = torch.sign(ground_state)
     torch_representatives = torch.from_numpy(representatives.view(np.int64)).reshape(-1,1)
-
     basis.build()
 
-#   Testing data transformations
-
-#    test_spin = np.array([representatives[123], representatives[125], representatives[323], representatives[1002], representatives[1311]])
-#    recovered_inds = basis.batched_index(test_spin)
-#    torch_spins = torch.from_numpy(test_spin.view(np.int64)).reshape(-1,1)
-#    np_spins = torch_spins[:,:1].reshape(1,-1)[0].numpy().view(np.uint64)
-
     getting_sign = vector_to_module(sign_structure, basis)
-#    print("Signs harvested", getting_sign(torch_spins))    
 
     amplitude = torch.nn.Sequential(
         nqs.Unpack(number_spins),
@@ -271,10 +250,6 @@ def main():
 
 #    combined_state = combine_amplitude_and_explicit_sign(amplitude, getting_sign)
     combined_state = combine_amplitude_and_sign(amplitude, neural_sign)
-#    print("combined_state(torch_spins)", combined_state(torch_spins))
-
-#    local_en = nqs.local_values(torch_spins, hamiltonian, combined_state)
-#    print(local_en)
 
     optimizer = torch.optim.SGD(
         list(combined_state.parameters()),
@@ -291,7 +266,6 @@ def main():
         output="test.result",
         epochs=500,
         sampling_options=nqs.SamplingOptions(number_samples=10000, number_chains=10, mode='exact'),
-#        sampling_mode="exact",
         exact=None,  # ground_state[:, 0],
         constraints=None,#{"hamming_weight": lambda i: 0.1},
         optimizer=optimizer,
@@ -303,46 +277,3 @@ def main():
     runner.run(1)
 
 main()
-
-# Old junk
-
-#def combine_amplitude_and_sign(*modules, apply_log: bool = False, out_dim: int = 1, use_jit: bool = True
-# ) -> torch.nn.Module:
-#     r"""Combines two torch.nn.Modules representing amplitudes and signs of the
-#     wavefunction coefficients into one model.
-#     """
-#     if out_dim != 1 and out_dim != 2:
-#         raise ValueError("invalid out_dim: {}; expected either 1 or 2".format(out_dim))
-#     if out_dim == 1 and apply_log:
-#         raise ValueError("apply_log is incompatible with out_dim=1")
-#
-#     class CombiningState(torch.nn.Module):
-#         __constants__ = ["apply_log", "out_dim"]
-#
-#         def __init__(self, amplitude, phase):
-#             super().__init__()
-#             self.apply_log = apply_log
-#             self.out_dim = out_dim
-#             self.amplitude = amplitude
-#             self.phase = phase
-#
-#         def forward(self, x):
-#             a = torch.log(self.amplitude(x)) if self.apply_log else self.amplitude(x)
-#             if self.out_dim == 1:
-#                 b = (1 - 2 * torch.argmax(self.phase(x), dim=1)).to(torch.float32).view([-1, 1])
-#                 a *= b
-#                 return a
-#             else:
-#                 b = 3.141592653589793 * torch.argmax(self.phase(x), dim=1).to(torch.float32).view(
-#                     [-1, 1]
-#                 )
-#
-#                 cat = torch.cat([a, b], dim=1)
-#                 complexify = torch.view_as_complex(cat).view([-1,1])
-#
-#                 return complexify
-
-#     m = CombiningState(*modules)
-#     if use_jit:
-#         m = torch.jit.script(m)
-#     return m
