@@ -140,6 +140,8 @@ Config = namedtuple(
         "exact",
         "constraints",
         "inference_batch_size",
+        "basis",
+        "ground_state"
     ],
     defaults=[],
 )
@@ -181,6 +183,23 @@ class Runner(nqs.RunnerBase):
         self.config.optimizer.zero_grad()
         batch_size = self.config.inference_batch_size
 
+        # Compute overlap
+        with torch.no_grad():
+
+            all_spins = torch.from_numpy(self.config.basis.states.view(np.int64)).reshape(-1,1)
+            print("all_spins", all_spins)
+            neural_state = self.combined_state(all_spins)
+            print("neural_state", neural_state)
+            norm = torch.sqrt(torch.dot(torch.conj(torch.exp(neural_state.reshape(1,-1)[0])), torch.exp(neural_state.reshape(1,-1)[0]))).real
+            print("norm", norm)
+            neural_state=torch.exp(neural_state.reshape(1,-1)[0])/norm
+            print("neural_state", neural_state)
+            print(torch.dot(torch.conj(neural_state), neural_state))
+            ground_state = self.config.ground_state
+            print("ground_state_norm", torch.dot(torch.conj(ground_state), ground_state))
+            overlap = torch.dot(torch.conj(ground_state.type(torch.complex64)), neural_state.type(torch.complex64))
+            print("overlap", overlap, torch.abs(overlap))
+
         # Computing gradients for the amplitude network
         logger.info("Computing gradients...")
         if _should_optimize(self.config.amplitude):
@@ -206,16 +225,16 @@ class Runner(nqs.RunnerBase):
         logger.info("Completed inner iteration in {:.1f} seconds!", tock - tick)
           
 def main():
-    number_spins = 24
+    number_spins = 32
     device = torch.device("cpu")
 
-#    basis, hamiltonian = load_basis_and_hamiltonian("pyrochlore.yaml")
-#    ground_state, E, representatives = load_ground_state("pyrochlore.h5")
+    basis, hamiltonian = load_basis_and_hamiltonian("pyrochlore.yaml")
+    ground_state, E, representatives = load_ground_state("pyrochlore.h5")
 #    basis, hamiltonian = load_basis_and_hamiltonian("kagome_12_periodic.yaml")
 #    ground_state, E, representatives = load_ground_state("kagome_12_periodic.h5")
 
-    basis, hamiltonian = load_basis_and_hamiltonian("square_24_periodic.yaml")
-    ground_state, E, representatives = load_ground_state("square_24_periodic.h5")
+#    basis, hamiltonian = load_basis_and_hamiltonian("square_24_periodic.yaml")
+#    ground_state, E, representatives = load_ground_state("square_24_periodic.h5")
     sign_structure = torch.sign(ground_state)
     torch_representatives = torch.from_numpy(representatives.view(np.int64)).reshape(-1,1)
     basis.build()
@@ -225,6 +244,8 @@ def main():
     amplitude = torch.nn.Sequential(
         nqs.Unpack(number_spins),
         torch.nn.Linear(number_spins, 64),
+        torch.nn.ReLU(),
+        torch.nn.Linear(64, 64),
         torch.nn.ReLU(),
         torch.nn.Linear(64, 64),
         torch.nn.ReLU(),
@@ -248,20 +269,20 @@ def main():
         torch.nn.Linear(64, 1, bias=False),
     ).to(device)
 
-#    combined_state = combine_amplitude_and_explicit_sign(amplitude, getting_sign)
-    combined_state = combine_amplitude_and_sign(amplitude, neural_sign)
+    combined_state = combine_amplitude_and_explicit_sign(amplitude, getting_sign)
+#    combined_state = combine_amplitude_and_sign(amplitude, neural_sign)
 
     optimizer = torch.optim.SGD(
         list(combined_state.parameters()),
-        lr=2e-2,
+        lr=1.4e-2,
         momentum=0.8,
 #        weight_decay=1e-4,
     )
-    # optimizer = torch.optim.Adam(list(amplitude.parameters()) + list(phase.parameters()), lr=1e-2)
+    optimizer = torch.optim.Adam(list(combined_state.parameters()), lr=1e-2)
     options = Config(
         amplitude=amplitude,
-#        phase=getting_sign,
-        phase=neural_sign,
+        phase=getting_sign,
+#        phase=neural_sign,
         hamiltonian=hamiltonian,
         output="test.result",
         epochs=500,
@@ -271,6 +292,8 @@ def main():
         optimizer=optimizer,
         scheduler=None,
         inference_batch_size=8192,
+        basis=basis,
+        ground_state=ground_state
     )
 
     runner = Runner(options)
