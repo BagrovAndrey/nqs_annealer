@@ -7,6 +7,7 @@ import nqs_playground.core as core
 import lattice_symmetries as ls
 import h5py
 import unpack_bits
+import runner_lib
 
 from collections import namedtuple
 import time
@@ -146,19 +147,18 @@ Config = namedtuple(
     defaults=[],
 )
 
-
 def _should_optimize(module):
     return any(map(lambda p: p.requires_grad, module.parameters()))
 
-class Runner(nqs.RunnerBase):
+class Runner(runner_lib.RunnerBase):
     def __init__(self, config):
         super().__init__(config)
-#        self.combined_state = combine_amplitude_and_explicit_sign(
-#            self.config.amplitude, self.config.phase, use_jit=False
-#        )
-        self.combined_state = combine_amplitude_and_sign(
+        self.combined_state = combine_amplitude_and_explicit_sign(
             self.config.amplitude, self.config.phase, use_jit=False
         )
+#        self.combined_state = combine_amplitude_and_sign(
+#            self.config.amplitude, self.config.phase, use_jit=False
+#        )
 
     def inner_iteration(self, states, log_probs, weights):
         assert weights.dtype == torch.float64
@@ -187,18 +187,14 @@ class Runner(nqs.RunnerBase):
         with torch.no_grad():
 
             all_spins = torch.from_numpy(self.config.basis.states.view(np.int64)).reshape(-1,1)
-            print("all_spins", all_spins)
             neural_state = self.combined_state(all_spins)
-            print("neural_state", neural_state)
             norm = torch.sqrt(torch.dot(torch.conj(torch.exp(neural_state.reshape(1,-1)[0])), torch.exp(neural_state.reshape(1,-1)[0]))).real
-            print("norm", norm)
             neural_state=torch.exp(neural_state.reshape(1,-1)[0])/norm
-            print("neural_state", neural_state)
-            print(torch.dot(torch.conj(neural_state), neural_state))
+
             ground_state = self.config.ground_state
-            print("ground_state_norm", torch.dot(torch.conj(ground_state), ground_state))
             overlap = torch.dot(torch.conj(ground_state.type(torch.complex64)), neural_state.type(torch.complex64))
-            print("overlap", overlap, torch.abs(overlap))
+
+        logger.info("Overlap = {}", overlap)
 
         # Computing gradients for the amplitude network
         logger.info("Computing gradients...")
@@ -243,17 +239,21 @@ def main():
 
     amplitude = torch.nn.Sequential(
         nqs.Unpack(number_spins),
-        torch.nn.Linear(number_spins, 64),
+        torch.nn.Linear(number_spins, 128),
         torch.nn.ReLU(),
-        torch.nn.Linear(64, 64),
+        torch.nn.Linear(128, 128),
         torch.nn.ReLU(),
-        torch.nn.Linear(64, 64),
+        torch.nn.Linear(128, 128),
         torch.nn.ReLU(),
-        torch.nn.Linear(64, 64),
+        torch.nn.Linear(128, 128),
         torch.nn.ReLU(),
-        torch.nn.Linear(64, 64),
+        torch.nn.Linear(128, 128),
         torch.nn.ReLU(),
-        torch.nn.Linear(64, 1, bias=False),
+        torch.nn.Linear(128, 128),
+        torch.nn.ReLU(),
+        torch.nn.Linear(128, 128),
+        torch.nn.ReLU(),
+        torch.nn.Linear(128, 1, bias=False),
     ).to(device)
 
     neural_sign = torch.nn.Sequential(
@@ -278,25 +278,26 @@ def main():
         momentum=0.8,
 #        weight_decay=1e-4,
     )
-    optimizer = torch.optim.Adam(list(combined_state.parameters()), lr=1e-2)
+    optimizer = torch.optim.Adam(list(combined_state.parameters()), lr=5e-4)
     options = Config(
         amplitude=amplitude,
         phase=getting_sign,
 #        phase=neural_sign,
         hamiltonian=hamiltonian,
         output="test.result",
-        epochs=500,
-        sampling_options=nqs.SamplingOptions(number_samples=10000, number_chains=10, mode='exact'),
+        epochs=3000,
+        sampling_options=nqs.SamplingOptions(number_samples=200, number_chains=10, mode='exact'),
         exact=None,  # ground_state[:, 0],
         constraints=None,#{"hamming_weight": lambda i: 0.1},
         optimizer=optimizer,
         scheduler=None,
         inference_batch_size=8192,
         basis=basis,
-        ground_state=ground_state
+        ground_state=ground_state,
     )
 
     runner = Runner(options)
     runner.run(1)
+    print(runner.dummy(5.3))
 
 main()

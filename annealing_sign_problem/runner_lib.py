@@ -42,9 +42,9 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, Optional, Tuple
 
-from .sampling import *
-from .hamiltonian import *
-from .core import forward_with_batches, get_dtype, get_device
+from nqs_playground.sampling import *
+from nqs_playground.hamiltonian import *
+from nqs_playground.core import forward_with_batches, get_dtype, get_device
 
 
 def _determine_initial_weights(
@@ -199,6 +199,10 @@ class RunnerBase:
                 assert not torch.any(torch.isnan(weights))
             self.inner_iteration(states, log_probs, weights)
             self.global_index += 1
+
+    def dummy(self, x):
+
+        return x**2
 
     def checkpoint(self, init=None):
         folder = os.path.join(self.config.output, "checkpoints")
