@@ -160,12 +160,21 @@ class RunnerBase:
         return local_energies.view(-1)
 
     def run(self, number_inner: int = 1):
+
+        print(list(self.config.amplitude.parameters()))
+
         for i in range(self.config.epochs):
             logger.info("Outer iteration №{}...", i)
             tick = time.time()
             self.outer_iteration(number_inner)
             tock = time.time()
+
+            if i == self.config.epochs - 1:
+                return self.outer_iteration(number_inner)
+
             logger.info("Completed outer iteration in {:.1f} seconds!", tock - tick)
+
+        
 
     @torch.no_grad()
     def compute_log_probs(self, states: Tensor) -> Tensor:
@@ -199,6 +208,12 @@ class RunnerBase:
                 assert not torch.any(torch.isnan(weights))
             self.inner_iteration(states, log_probs, weights)
             self.global_index += 1
+
+            # Trained network output pipeline - 1
+            #if i == number_inner-1:
+            print("Done with ", i)
+
+        return self.inner_iteration(states, log_probs, weights)
 
     def dummy(self, x):
 

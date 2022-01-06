@@ -16,28 +16,6 @@ from loguru import logger
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 
-class DenseModel(torch.nn.Module):
-    def __init__(self, shape, number_features, use_batchnorm=True, dropout=None):
-        super().__init__()
-        number_blocks = len(number_features)
-        number_features = number_features + [2]
-        layers = [torch.nn.Linear(shape[0] * shape[1], number_features[0])]
-        for i in range(1, len(number_features)):
-            layers.append(torch.nn.ReLU(inplace=True))
-            if use_batchnorm:
-                layers.append(torch.nn.BatchNorm1d(number_features[i - 1]))
-            if dropout is not None:
-                layers.append(torch.nn.Dropout(p=dropout, inplace=True))
-            layers.append(torch.nn.Linear(number_features[i - 1], number_features[i]))
-
-        self.shape = shape
-        self.layers = torch.nn.Sequential(*layers)
-
-    def forward(self, x):
-        number_spins = self.shape[0] * self.shape[1]
-        x = nqs.unpack(x, number_spins)
-        return self.layers(x)
-
 def load_ground_state(filename: str):
     with h5py.File(filename, "r") as f:
         ground_state = f["/hamiltonian/eigenvectors"][:]
@@ -213,12 +191,17 @@ class Runner(runner_lib.RunnerBase):
                 output = forward_fn(states_chunk)
                 output.backward(grad_chunk)
 
+        #print("Before", list((self.config.amplitude).parameters()))
         self.config.optimizer.step()
+        #print("After", list((self.config.amplitude).parameters()))
+
         if self.config.scheduler is not None:
             self.config.scheduler.step()
         self.checkpoint(init={"optimizer": self.config.optimizer.state_dict()})
         tock = time.time()
         logger.info("Completed inner iteration in {:.1f} seconds!", tock - tick)
+
+        return self.config.amplitude
           
 def main():
     number_spins = 32
@@ -237,7 +220,7 @@ def main():
 
     getting_sign = vector_to_module(sign_structure, basis)
 
-    amplitude = torch.nn.Sequential(
+    """    amplitude = torch.nn.Sequential(
         nqs.Unpack(number_spins),
         torch.nn.Linear(number_spins, 128),
         torch.nn.ReLU(),
@@ -254,6 +237,15 @@ def main():
         torch.nn.Linear(128, 128),
         torch.nn.ReLU(),
         torch.nn.Linear(128, 1, bias=False),
+    ).to(device)"""
+
+    amplitude = torch.nn.Sequential(
+        nqs.Unpack(number_spins),
+        torch.nn.Linear(number_spins, 5),
+        torch.nn.ReLU(),
+        torch.nn.Linear(5, 5),
+        torch.nn.ReLU(),
+        torch.nn.Linear(5, 1, bias=False),
     ).to(device)
 
     neural_sign = torch.nn.Sequential(
@@ -285,7 +277,7 @@ def main():
 #        phase=neural_sign,
         hamiltonian=hamiltonian,
         output="test.result",
-        epochs=3000,
+        epochs=1,
         sampling_options=nqs.SamplingOptions(number_samples=200, number_chains=10, mode='exact'),
         exact=None,  # ground_state[:, 0],
         constraints=None,#{"hamming_weight": lambda i: 0.1},
@@ -297,7 +289,55 @@ def main():
     )
 
     runner = Runner(options)
-    runner.run(1)
-    print(runner.dummy(5.3))
+    test_output = runner.run(3)
 
-main()
+    print(list(test_output.parameters()))
+
+    options2 = Config(
+        amplitude=test_output,
+        phase=getting_sign,
+#        phase=neural_sign,
+        hamiltonian=hamiltonian,
+        output="test.result",
+        epochs=1,
+        sampling_options=nqs.SamplingOptions(number_samples=200, number_chains=10, mode='exact'),
+        exact=None,  # ground_state[:, 0],
+        constraints=None,#{"hamming_weight": lambda i: 0.1},
+        optimizer=optimizer,
+        scheduler=None,
+        inference_batch_size=8192,
+        basis=basis,
+        ground_state=ground_state,
+    )
+
+    runner = Runner(options2)
+    test_output = runner.run(3)
+
+    print(list(test_output.parameters()))
+
+if __name__ == "__main__":
+    main()
+
+##   Not really needed
+
+"""class DenseModel(torch.nn.Module):
+    def __init__(self, shape, number_features, use_batchnorm=True, dropout=None):
+        super().__init__()
+        number_blocks = len(number_features)
+        number_features = number_features + [2]
+        layers = [torch.nn.Linear(shape[0] * shape[1], number_features[0])]
+        for i in range(1, len(number_features)):
+            layers.append(torch.nn.ReLU(inplace=True))
+            if use_batchnorm:
+                layers.append(torch.nn.BatchNorm1d(number_features[i - 1]))
+            if dropout is not None:
+                layers.append(torch.nn.Dropout(p=dropout, inplace=True))
+            layers.append(torch.nn.Linear(number_features[i - 1], number_features[i]))
+
+        self.shape = shape
+        self.layers = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        number_spins = self.shape[0] * self.shape[1]
+        x = nqs.unpack(x, number_spins)
+        return self.layers(x)"""
