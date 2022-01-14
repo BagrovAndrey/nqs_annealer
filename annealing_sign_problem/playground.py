@@ -97,7 +97,11 @@ def vector_to_module(vector: torch.Tensor, basis) -> torch.nn.Module:
 
         def forward(self, x):
             x = x[:,:1].reshape(1,-1)[0].cpu().detach().numpy().view(np.uint64)
-            ind = self.basis.batched_index(x)
+
+            # Playing around with symmetries
+            #x, _, _ = self.basis.batched_state_info(x)
+            
+            ind = self.basis.batched_index(x)            
             ind = torch.from_numpy(ind.view(np.int64))
             sign = self.vector[ind]
             return sign
@@ -172,7 +176,10 @@ class Runner(runner_lib.RunnerBase):
             ground_state = self.config.ground_state
             overlap = torch.dot(torch.conj(ground_state.type(torch.complex64)), neural_state.type(torch.complex64))
 
-        logger.info("Overlap = {}", overlap)
+        with open("overlap.txt", "a") as f:
+            np.savetxt(f, np.array([np.real(overlap.numpy())]))
+
+        logger.info("Overlap = {}", overlap)    
 
         # Computing gradients for the amplitude network
         logger.info("Computing gradients...")
@@ -220,33 +227,33 @@ def main():
 
     getting_sign = vector_to_module(sign_structure, basis)
 
-    """    amplitude = torch.nn.Sequential(
-        nqs.Unpack(number_spins),
-        torch.nn.Linear(number_spins, 128),
-        torch.nn.ReLU(),
-        torch.nn.Linear(128, 128),
-        torch.nn.ReLU(),
-        torch.nn.Linear(128, 128),
-        torch.nn.ReLU(),
-        torch.nn.Linear(128, 128),
-        torch.nn.ReLU(),
-        torch.nn.Linear(128, 128),
-        torch.nn.ReLU(),
-        torch.nn.Linear(128, 128),
-        torch.nn.ReLU(),
-        torch.nn.Linear(128, 128),
-        torch.nn.ReLU(),
-        torch.nn.Linear(128, 1, bias=False),
-    ).to(device)"""
-
     amplitude = torch.nn.Sequential(
+        nqs.Unpack(number_spins),
+        torch.nn.Linear(number_spins, 256),
+        torch.nn.ReLU(),
+        torch.nn.Linear(256, 256),
+        torch.nn.ReLU(),
+        torch.nn.Linear(256, 256),
+        torch.nn.ReLU(),
+#        torch.nn.Linear(64, 64),
+#        torch.nn.ReLU(),
+#        torch.nn.Linear(64, 64),
+#        torch.nn.ReLU(),
+#        torch.nn.Linear(64, 64),
+#        torch.nn.ReLU(),
+#        torch.nn.Linear(64, 64),
+#        torch.nn.ReLU(),
+        torch.nn.Linear(256, 1, bias=False),
+    ).to(device)
+
+    """amplitude = torch.nn.Sequential(
         nqs.Unpack(number_spins),
         torch.nn.Linear(number_spins, 5),
         torch.nn.ReLU(),
         torch.nn.Linear(5, 5),
         torch.nn.ReLU(),
         torch.nn.Linear(5, 1, bias=False),
-    ).to(device)
+    ).to(device)"""
 
     neural_sign = torch.nn.Sequential(
         nqs.Unpack(number_spins),
@@ -264,21 +271,17 @@ def main():
     combined_state = combine_amplitude_and_explicit_sign(amplitude, getting_sign)
 #    combined_state = combine_amplitude_and_sign(amplitude, neural_sign)
 
-    optimizer = torch.optim.SGD(
-        list(combined_state.parameters()),
-        lr=1.4e-2,
-        momentum=0.8,
-#        weight_decay=1e-4,
-    )
+    optimizer = torch.optim.SGD(list(combined_state.parameters()), lr=1.4e-2, momentum=0.8) #,        weight_decay=1e-4,    )
     optimizer = torch.optim.Adam(list(combined_state.parameters()), lr=5e-4)
+
     options = Config(
         amplitude=amplitude,
-        phase=getting_sign,
-#        phase=neural_sign,
+#        phase=getting_sign,
+        phase=neural_sign,
         hamiltonian=hamiltonian,
         output="test.result",
-        epochs=1,
-        sampling_options=nqs.SamplingOptions(number_samples=200, number_chains=10, mode='exact'),
+        epochs=5000,
+        sampling_options=nqs.SamplingOptions(number_samples=16, number_chains=64, mode='exact'),
         exact=None,  # ground_state[:, 0],
         constraints=None,#{"hamming_weight": lambda i: 0.1},
         optimizer=optimizer,
@@ -289,31 +292,38 @@ def main():
     )
 
     runner = Runner(options)
-    test_output = runner.run(3)
+    amp_output = runner.run(1)
 
-    print(list(test_output.parameters()))
+#    print(list(amp_output.parameters()))
 
-    options2 = Config(
-        amplitude=test_output,
-        phase=getting_sign,
-#        phase=neural_sign,
-        hamiltonian=hamiltonian,
-        output="test.result",
-        epochs=1,
-        sampling_options=nqs.SamplingOptions(number_samples=200, number_chains=10, mode='exact'),
-        exact=None,  # ground_state[:, 0],
-        constraints=None,#{"hamming_weight": lambda i: 0.1},
-        optimizer=optimizer,
-        scheduler=None,
-        inference_batch_size=8192,
-        basis=basis,
-        ground_state=ground_state,
-    )
+# Creating an outer cycle
 
-    runner = Runner(options2)
-    test_output = runner.run(3)
+    for iloop in range(10):
 
-    print(list(test_output.parameters()))
+        optimizer = torch.optim.Adam(list(combined_state.parameters()), lr=5e-4)
+    #    optimizer = torch.optim.SGD(list(combined_state.parameters()), lr=1.4e-3, momentum=0.8) #,        weight_decay=1e-4,    )
+
+        options = Config(
+            amplitude=amp_output,
+            phase=getting_sign,
+    #        phase=neural_sign,
+            hamiltonian=hamiltonian,
+            output="test.result",
+            epochs=100,
+            sampling_options=nqs.SamplingOptions(number_samples=5000, number_chains=10, mode='exact'),
+            exact=None,  # ground_state[:, 0],
+            constraints=None,#{"hamming_weight": lambda i: 0.1},
+            optimizer=optimizer,
+            scheduler=None,
+            inference_batch_size=8192,
+            basis=basis,
+            ground_state=ground_state,
+        )
+
+        runner = Runner(options)
+        amp_output = runner.run(1)
+
+#        print(list(amp_output.parameters()))
 
 if __name__ == "__main__":
     main()

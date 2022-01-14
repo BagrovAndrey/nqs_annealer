@@ -1,40 +1,15 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
-sa_accuracy = np.loadtxt("SA_accuracy.txt")
-overlaps = np.loadtxt("overlaps.txt")
-accuracy = np.loadtxt("accuracies.txt")
+overlaps = np.loadtxt("annealing_sign_problem/overlap.txt")
 
-indices_sa = np.array([iloop for iloop in range(len(sa_accuracy))])
 indices_ov = np.array([iloop for iloop in range(len(overlaps))])
-indices_ac = np.array([iloop for iloop in range(len(accuracy))])
-
-fig, ax = plt.subplots()
-ax.scatter(accuracy, overlaps)
-ax.set(xlabel='Accuracy', ylabel='Overlap')
-ax.grid()
-fig.savefig("overlap_vs_accuracy.pdf")
-plt.show()
-
-fig, ax = plt.subplots()
-ax.plot(indices_sa, sa_accuracy, 'o')
-ax.set(xlabel='Aeon', ylabel='SA accuracy')
-ax.grid()
-fig.savefig("Sa_vs_aeon.pdf")
-plt.show()
 
 fig, ax = plt.subplots()
 ax.plot(indices_ov, overlaps, 'o')
 ax.set(xlabel='Aeon', ylabel='Overlap')
 ax.grid()
-fig.savefig("overlaps_vs_aeon.pdf")
-plt.show()
-
-fig, ax = plt.subplots()
-ax.plot(indices_ac, accuracy, 'o')
-ax.set(xlabel='Aeon', ylabel='Accuracy')
-ax.grid()
-fig.savefig("accuracy_vs_aeon.pdf")
+fig.savefig("overlaps.pdf")
 plt.show()
 
 """datasize = np.loadtxt("SAacc_vs_dataset/dataset_size.txt")
