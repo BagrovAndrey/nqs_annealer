@@ -1,0 +1,21 @@
+basis:
+  number_spins: 16
+  hamming_weight: 8
+  symmetries: []
+
+hamiltonian:
+  name: kagome-16
+  terms:
+    - matrix: [[0.01, 0, 0, 0],
+               [0, -0.01, 0.02, 0],
+               [0, 0.02, -0.01, 0],
+               [0, 0, 0, 0.01]]
+
+      sites: [[0, 3], [0, 4], [1, 5], [1, 6], [2, 3], [2, 8], [3, 4], [3, 8], [4, 5], [4, 9], [5, 6], [5, 9], [6, 7], [6, 10], [7, 10], [8, 11], [8, 12], [9, 13], [9, 14], [10, 15], [11, 12], [12, 13], [13, 14], [14, 15]]    
+
+observables: []
+number_vectors: 1
+output: "kagome_16.h5"
+datatype: "float32"
+max_primme_block_size: 4
+max_primme_basis_size: 20

@@ -4,6 +4,8 @@ import yaml
 import nqs_playground as nqs
 import nqs_playground.sgd as sgd
 import nqs_playground.core as core
+import nqs_playground._jacobian as jac
+
 import lattice_symmetries as ls
 import h5py
 import unpack_bits
@@ -209,13 +211,140 @@ class Runner(runner_lib.RunnerBase):
         logger.info("Completed inner iteration in {:.1f} seconds!", tock - tick)
 
         return self.config.amplitude
+
+ConfigSR = namedtuple(
+    "Config",
+    [
+        "amplitude",
+        "phase",
+        "hamiltonian",
+        "output",
+        "epochs",
+        "sampling_options",
+        "optimizer",
+        "scheduler",
+        "exact",
+        "linear_system_kwargs",
+        "inference_batch_size",
+    ],
+    defaults=[],
+)
+
+@torch.no_grad()
+def solve_linear_problem(A: Tensor, b: Tensor, rcond: float) -> Tensor:
+    r"""Solve linear problem `A · x = b` where `A` is approximately positive-definite."""
+    logger.debug("Computing SVD of {} matrix...", A.size())
+    u, s, v = (t.to(A.device) for t in torch.svd(A.cpu()))
+    logger.debug("Computing inverse...")
+    s_inv = torch.where(
+        s > rcond * torch.max(s),
+        torch.reciprocal(s),
+        torch.scalar_tensor(0, dtype=s.dtype, device=s.device),
+    )
+    return v.mv(s_inv.mul_(u.t().mv(b)))
+
+
+def _compute_centered_jacobian(module, inputs, weights):
+    parameters = list(filter(lambda p: p.requires_grad, module.parameters()))
+    if len(parameters) > 0:
+        logger.info("Calculating jacobian...")
+        if hasattr(module, "log_prob"):
+            f = lambda x: module.log_prob(x)
+        else:
+            f = module
+        gradients = jac.jacobian(f, parameters, inputs)
+        with torch.no_grad():
+
+            print("weights", weights.dtype)
+            print("gradients", gradients.dtype)
+
+            gradients -= weights.float() @ gradients.float()
+        return gradients
+    else:
+        logger.debug("Module contains no trainable parameters")
+        return None
+
+
+def compute_centered_jacobian(amplitude, phase, inputs, weights):
+    Ore = _compute_centered_jacobian(amplitude, inputs, weights)
+    Oim = _compute_centered_jacobian(phase, inputs, weights)
+    return Ore, Oim
+
+
+def _compute_gradient_with_curvature(O: Tensor, E: Tensor, weights: Tensor, **kwargs) -> Tensor:
+    if O is None:
+        return None
+    logger.debug("Computing simple gradient...")
+    f = torch.mv(O.t(), E)
+    logger.debug("Computing covariance matrix...")
+    S = torch.einsum("ij,j,jk", O.t(), weights, O)
+    logger.info("Computing true gradient δ by solving S⁻¹·δ = f...")
+    δ = solve_linear_problem(S, f, **kwargs)
+    return δ
+
+
+def compute_gradient_with_curvature(
+    Ore: Tensor, Oim: Tensor, E: Tensor, weights: Tensor, **kwargs
+) -> Tensor:
+
+    E = 2 * weights * E
+    δre = _compute_gradient_with_curvature(Ore, E.real, weights, **kwargs)
+    δim = _compute_gradient_with_curvature(Oim, E.imag, weights, **kwargs)
+    return δre, δim
+
+
+class SRRunner(runner_lib.RunnerBase):
+    def __init__(self, config):
+        super().__init__(config)
+        self.combined_state = combine_amplitude_and_explicit_sign(
+            self.config.amplitude, self.config.phase, use_jit=False
+        )
+
+    @torch.no_grad()
+    def _set_gradient(self, grads):
+        def run(m, grad):
+            i = 0
+            for p in filter(lambda x: x.requires_grad, m.parameters()):
+                assert p.is_leaf
+                n = p.numel()
+                if p.grad is not None:
+                    p.grad.copy_(grad[i : i + n].view(p.size()))
+                else:
+                    p.grad = grad[i : i + n].view(p.size())
+                i += n
+            assert grad is None or i == grad.numel()
+
+        run(self.config.amplitude, grads[0])
+        run(self.config.phase, grads[1])
+
+    def inner_iteration(self, states, log_probs, weights):
+        logger.info("Inner iteration...")
+        tick = time.time()
+        E = self.compute_local_energies(states, weights)
+        states = states.view(-1, states.size(-1))
+        log_probs = states.view(-1)
+        weights = weights.view(-1)
+
+        Os = compute_centered_jacobian(self.config.amplitude, self.config.phase, states, weights)
+        grads = compute_gradient_with_curvature(*Os, E, weights, **self.config.linear_system_kwargs)
+        self._set_gradient(grads)
+        self.config.optimizer.step()
+        if self.config.scheduler is not None:
+            self.config.scheduler.step()
+        self.checkpoint(init={"optimizer": self.config.optimizer.state_dict()})
+        tock = time.time()
+        logger.info("Completed inner iteration in {:.1f} seconds!", tock - tick)
           
 def main():
-    number_spins = 32
+    number_spins = 24
     device = torch.device("cpu")
 
-    basis, hamiltonian = load_basis_and_hamiltonian("pyrochlore.yaml")
-    ground_state, E, representatives = load_ground_state("pyrochlore.h5")
+    basis, hamiltonian = load_basis_and_hamiltonian("../../annealing-sign-problem/data/kagome_24_periodic/kagome_24_periodic.yaml")
+    ground_state, E, representatives = load_ground_state("../../annealing-sign-problem/data/kagome_24_periodic/kagome_24_periodic.h5")
+
+#    basis, hamiltonian = load_basis_and_hamiltonian("../../annealing-sign-problem/data/lesser_symm_pyro/pyrochlore.yaml")
+#    ground_state, E, representatives = load_ground_state("../../annealing-sign-problem/data/lesser_symm_pyro/pyrochlore.h5")
+
 #    basis, hamiltonian = load_basis_and_hamiltonian("kagome_12_periodic.yaml")
 #    ground_state, E, representatives = load_ground_state("kagome_12_periodic.h5")
 
@@ -229,11 +358,11 @@ def main():
 
     amplitude = torch.nn.Sequential(
         nqs.Unpack(number_spins),
-        torch.nn.Linear(number_spins, 256),
+        torch.nn.Linear(number_spins, 1024),
         torch.nn.ReLU(),
-        torch.nn.Linear(256, 256),
+        torch.nn.Linear(1024, 1024),
         torch.nn.ReLU(),
-        torch.nn.Linear(256, 256),
+        torch.nn.Linear(1024, 1024),
         torch.nn.ReLU(),
 #        torch.nn.Linear(64, 64),
 #        torch.nn.ReLU(),
@@ -243,7 +372,7 @@ def main():
 #        torch.nn.ReLU(),
 #        torch.nn.Linear(64, 64),
 #        torch.nn.ReLU(),
-        torch.nn.Linear(256, 1, bias=False),
+        torch.nn.Linear(1024, 1, bias=False),
     ).to(device)
 
     """amplitude = torch.nn.Sequential(
@@ -272,16 +401,16 @@ def main():
 #    combined_state = combine_amplitude_and_sign(amplitude, neural_sign)
 
     optimizer = torch.optim.SGD(list(combined_state.parameters()), lr=1.4e-2, momentum=0.8) #,        weight_decay=1e-4,    )
-    optimizer = torch.optim.Adam(list(combined_state.parameters()), lr=5e-4)
+    optimizer = torch.optim.Adam(list(combined_state.parameters()), lr=2e-4)
 
     options = Config(
         amplitude=amplitude,
-#        phase=getting_sign,
-        phase=neural_sign,
+        phase=getting_sign,
+#        phase=neural_sign,
         hamiltonian=hamiltonian,
         output="test.result",
-        epochs=5000,
-        sampling_options=nqs.SamplingOptions(number_samples=16, number_chains=64, mode='exact'),
+        epochs=2000,
+        sampling_options=nqs.SamplingOptions(number_samples=8, number_chains=128, sweep_size=4, number_discarded=10, mode='zanella'),
         exact=None,  # ground_state[:, 0],
         constraints=None,#{"hamming_weight": lambda i: 0.1},
         optimizer=optimizer,
@@ -291,8 +420,26 @@ def main():
         ground_state=ground_state,
     )
 
+    optionsSR = ConfigSR(
+        amplitude=amplitude,
+        phase=getting_sign,
+#        phase=neural_sign,
+        hamiltonian=hamiltonian,
+        output="test.result",
+        epochs=5000,
+        sampling_options=nqs.SamplingOptions(number_samples=8, number_chains=128, sweep_size=4, number_discarded=10, mode='zanella'),
+        exact=None,  # ground_state[:, 0],
+        optimizer=optimizer,
+        scheduler=None,
+        inference_batch_size=8192,
+        linear_system_kwargs={"rcond": 1e-4},
+    )
+
+    #runner = SRRunner(optionsSR)
+    #amp_output = runner.run(0)
+
     runner = Runner(options)
-    amp_output = runner.run(1)
+    amp_output = runner.run(0)
 
 #    print(list(amp_output.parameters()))
 
@@ -310,7 +457,7 @@ def main():
             hamiltonian=hamiltonian,
             output="test.result",
             epochs=100,
-            sampling_options=nqs.SamplingOptions(number_samples=5000, number_chains=10, mode='exact'),
+            sampling_options=nqs.SamplingOptions(number_samples=64, number_chains=128, mode='exact'),
             exact=None,  # ground_state[:, 0],
             constraints=None,#{"hamming_weight": lambda i: 0.1},
             optimizer=optimizer,
