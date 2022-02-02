@@ -1,14 +1,15 @@
 import argparse
-from .common import *
+#from .common import *
+from annealing_sign_problem import * #extract_classical_ising_model
 import ctypes
 from collections import namedtuple
 from typing import Tuple
 import lattice_symmetries as ls
-import nqs_playground as nqs
-from nqs_playground.core import _get_dtype, _get_device
+#import nqs_playground as nqs
+#from nqs_playground.core import _get_dtype, _get_device
 import torch
 from torch import Tensor
-from torch.utils.tensorboard import SummaryWriter
+#from torch.utils.tensorboard import SummaryWriter
 from typing import Optional
 import time
 from loguru import logger
@@ -16,31 +17,10 @@ import sys
 import numpy as np
 import concurrent.futures
 
+def project_dir():
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
-class TensorIterableDataset(torch.utils.data.IterableDataset):
-    def __init__(self, *tensors, batch_size=1, shuffle=False):
-        assert all(tensors[0].size(0) == tensor.size(0) for tensor in tensors)
-        assert all(tensors[0].device == tensor.device for tensor in tensors)
-        self.tensors = tensors
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-
-    @property
-    def device(self):
-        return self.tensors[0].device
-
-    def __len__(self):
-        return self.tensors[0].size(0)
-
-    def __iter__(self):
-        if self.shuffle:
-            indices = torch.randperm(self.tensors[0].size(0), device=self.device)
-            tensors = tuple(tensor[indices] for tensor in self.tensors)
-        else:
-            tensors = self.tensors
-        return zip(*(torch.split(tensor, self.batch_size) for tensor in tensors))
-
-class DenseModel(torch.nn.Module):
+"""class DenseModel(torch.nn.Module):
     def __init__(self, shape, number_features, use_batchnorm=True, dropout=None):
         super().__init__()
         number_blocks = len(number_features)
@@ -60,7 +40,7 @@ class DenseModel(torch.nn.Module):
     def forward(self, x):
         number_spins = self.shape[0] * self.shape[1]
         x = nqs.unpack(x, number_spins)
-        return self.layers(x)
+        return self.layers(x)"""
 
 def _extract_classical_model_with_exact_fields(
     spins, hamiltonian, ground_state, sampled_power, device
@@ -113,7 +93,7 @@ def tune_sign_structure(
         device=device,
         scale_field=scale_field,
     )
-    x, _, e = sa.anneal(h, x0, seed=seed, number_sweeps=number_sweeps, beta0=beta0, beta1=beta1)
+    x, _, e = sa.anneal(h, seed=seed, number_sweeps=number_sweeps, beta0=beta0, beta1=beta1)
     if ground_state is not None:
         h_exact, _, x0_exact, _ = _extract_classical_model_with_exact_fields(
             spins0,
@@ -158,7 +138,6 @@ def tune_sign_structure(
 Config = namedtuple(
     "Config",
     [
-        "model",
         "ground_state",
         "hamiltonian",
         "number_sa_sweeps",
@@ -271,7 +250,6 @@ def main():
     parser.add_argument("--samples", type=int, default=30000, help="Number MC samples.")
     parser.add_argument("--seed", type=int, default=np.random.randint(100, 10000), help="Seed.")
     parser.add_argument("--device", type=str, default=None, help="Device.")
-    parser.add_argument("--kernels", type=str, help="Layer widths.")
     args = parser.parse_args()
 
     with open("chain_length.txt", "a") as f5:
@@ -285,11 +263,18 @@ def main():
 #        os.path.join(project_dir(), "../random_glass/SK_16.yaml")
 #    )
 
+#    ground_state, E, representatives = load_ground_state(
+#        os.path.join(project_dir(), "../kagome_16/tom_kagome_16.h5")
+#    )
+#    basis, hamiltonian = load_basis_and_hamiltonian(
+#        os.path.join(project_dir(), "../kagome_16/tom_kagome_16.yaml")
+#    )
+
     ground_state, E, representatives = load_ground_state(
-        os.path.join(project_dir(), "../kagome_16/tom_kagome_16.h5")
+        os.path.join(project_dir(), "../physical_systems/j1j2_square_4x4.h5")
     )
     basis, hamiltonian = load_basis_and_hamiltonian(
-        os.path.join(project_dir(), "../kagome_16/tom_kagome_16.yaml")
+        os.path.join(project_dir(), "../physical_systems/j1j2_square_4x4.yaml")
     )
 
     basis.build(representatives)
@@ -308,10 +293,7 @@ def main():
 
     print(device)
 
-    model = DenseModel((1, 16), number_features=[2], use_batchnorm=True, dropout=None).to(device)
-
     config = Config(
-        model=model,
         ground_state=ground_state,
         hamiltonian=hamiltonian,
         number_sa_sweeps=args.sweeps,
@@ -323,3 +305,7 @@ def main():
     os.makedirs(config.output, exist_ok=True)
     anneal(config)
 
+if __name__ == "__main__":
+
+    for iloop in range(10):
+        main()
